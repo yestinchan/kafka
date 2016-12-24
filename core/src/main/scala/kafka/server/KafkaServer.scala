@@ -23,16 +23,18 @@ import kafka.log.CleanerConfig
 import kafka.log.LogManager
 import kafka.utils._
 import java.util.concurrent._
-import atomic.{AtomicInteger, AtomicBoolean}
+import atomic.{AtomicBoolean, AtomicInteger}
 import java.io.File
+
 import org.I0Itec.zkclient.ZkClient
 import kafka.controller.{ControllerStats, KafkaController}
 import kafka.cluster.Broker
-import kafka.api.{ControlledShutdownResponse, ControlledShutdownRequest}
+import kafka.api.{ControlledShutdownRequest, ControlledShutdownResponse}
 import kafka.common.ErrorMapping
-import kafka.network.{Receive, BlockingChannel, SocketServer}
+import kafka.network.{BlockingChannel, Receive, SocketServer}
 import kafka.metrics.KafkaMetricsGroup
 import com.yammer.metrics.core.Gauge
+import kafka.plugin.KafkaCommander
 
 /**
  * Represents the lifecycle of a single Kafka broker. Handles all functionality required
@@ -56,6 +58,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
   var kafkaController: KafkaController = null
   val kafkaScheduler = new KafkaScheduler(config.backgroundThreads)
   var zkClient: ZkClient = null
+  var kafkaCommander: KafkaCommander = null
 
   newGauge(
     "BrokerState",
@@ -84,6 +87,10 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
       /* start log manager */
       logManager = createLogManager(zkClient, brokerState)
       logManager.startup()
+
+      kafkaCommander = new KafkaCommander()
+      kafkaCommander.startup(config.hostName, config.port + 1)
+      info("kafka commander started")
 
       socketServer = new SocketServer(config.brokerId,
                                       config.hostName,
@@ -268,6 +275,8 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
       if (canShutdown) {
         Utils.swallow(controlledShutdown())
         brokerState.newState(BrokerShuttingDown)
+        if(kafkaCommander != null)
+          kafkaCommander.shutdown()
         if(socketServer != null)
           Utils.swallow(socketServer.shutdown())
         if(requestHandlerPool != null)

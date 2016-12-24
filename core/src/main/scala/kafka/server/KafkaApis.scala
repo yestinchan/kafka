@@ -25,10 +25,10 @@ import kafka.network._
 import kafka.admin.AdminUtils
 import kafka.network.RequestChannel.Response
 import kafka.controller.KafkaController
-import kafka.utils.{ZkUtils, ZKGroupTopicDirs, SystemTime, Logging}
+import kafka.plugin.KafkaCommandState
+import kafka.utils.{Logging, SystemTime, ZKGroupTopicDirs, ZkUtils}
 
 import scala.collection._
-
 import org.I0Itec.zkclient.ZkClient
 
 /**
@@ -200,67 +200,89 @@ class KafkaApis(val requestChannel: RequestChannel,
             "and recommended configuration.").format(produceRequest.clientId, request.remoteAddress, produceRequest.requiredAcks))
     }
 
-    val sTime = SystemTime.milliseconds
-    val localProduceResults = appendToLocalLog(produceRequest, offsetCommitRequestOpt.nonEmpty)
-    debug("Produce to local log in %d ms".format(SystemTime.milliseconds - sTime))
-
-    val firstErrorCode = localProduceResults.find(_.errorCode != ErrorMapping.NoError).map(_.errorCode).getOrElse(ErrorMapping.NoError)
-
-    val numPartitionsInError = localProduceResults.count(_.error.isDefined)
-    if(produceRequest.requiredAcks == 0) {
-      // no operation needed if producer request.required.acks = 0; however, if there is any exception in handling the request, since
-      // no response is expected by the producer the handler will send a close connection response to the socket server
-      // to close the socket so that the producer client will know that some exception has happened and will refresh its metadata
-      if (numPartitionsInError != 0) {
-        info(("Send the close connection response due to error handling produce request " +
+    if (!KafkaCommandState.canProduce) {
+      warn("kafka commander already stopped receive.")
+      if(produceRequest.requiredAcks == 0) {
+        // no operation needed if producer request.required.acks = 0; however, if there is any exception in handling the request, since
+        // no response is expected by the producer the handler will send a close connection response to the socket server
+        // to close the socket so that the producer client will know that some exception has happened and will refresh its metadata
+        info(("Send the close connection response due to receive shutdown by kafkaCommander  " +
           "[clientId = %s, correlationId = %s, topicAndPartition = %s] with Ack=0")
           .format(produceRequest.clientId, produceRequest.correlationId, produceRequest.topicPartitionMessageSizeMap.keySet.mkString(",")))
         requestChannel.closeConnection(request.processor, request)
       } else {
+        val errorResults = generateErrorResult(produceRequest, offsetCommitRequestOpt.nonEmpty)
 
-        if (firstErrorCode == ErrorMapping.NoError)
-          offsetCommitRequestOpt.foreach(ocr => offsetManager.putOffsets(ocr.groupId, ocr.requestInfo))
+        val statuses = errorResults.map(r => r.key -> ProducerResponseStatus(r.errorCode, r.start)).toMap
+        val response = offsetCommitRequestOpt.map(_.responseFor(ErrorMapping.BrokerNotAvailableCode, config.offsetMetadataMaxSize))
+          .getOrElse(ProducerResponse(produceRequest.correlationId, statuses))
 
-        if (offsetCommitRequestOpt.isDefined) {
-          val response = offsetCommitRequestOpt.get.responseFor(firstErrorCode, config.offsetMetadataMaxSize)
-          requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
-        } else
-          requestChannel.noOperation(request.processor, request)
+        requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
       }
-    } else if (produceRequest.requiredAcks == 1 ||
+
+    } else {
+      val sTime = SystemTime.milliseconds
+      val localProduceResults = appendToLocalLog(produceRequest, offsetCommitRequestOpt.nonEmpty)
+      debug("Produce to local log in %d ms".format(SystemTime.milliseconds - sTime))
+
+      val firstErrorCode = localProduceResults.find(_.errorCode != ErrorMapping.NoError).map(_.errorCode).getOrElse(ErrorMapping.NoError)
+
+      val numPartitionsInError = localProduceResults.count(_.error.isDefined)
+      if(produceRequest.requiredAcks == 0) {
+        // no operation needed if producer request.required.acks = 0; however, if there is any exception in handling the request, since
+        // no response is expected by the producer the handler will send a close connection response to the socket server
+        // to close the socket so that the producer client will know that some exception has happened and will refresh its metadata
+        if (numPartitionsInError != 0) {
+          info(("Send the close connection response due to error handling produce request " +
+            "[clientId = %s, correlationId = %s, topicAndPartition = %s] with Ack=0")
+            .format(produceRequest.clientId, produceRequest.correlationId, produceRequest.topicPartitionMessageSizeMap.keySet.mkString(",")))
+          requestChannel.closeConnection(request.processor, request)
+        } else {
+
+          if (firstErrorCode == ErrorMapping.NoError)
+            offsetCommitRequestOpt.foreach(ocr => offsetManager.putOffsets(ocr.groupId, ocr.requestInfo))
+
+          if (offsetCommitRequestOpt.isDefined) {
+            val response = offsetCommitRequestOpt.get.responseFor(firstErrorCode, config.offsetMetadataMaxSize)
+            requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
+          } else
+            requestChannel.noOperation(request.processor, request)
+        }
+      } else if (produceRequest.requiredAcks == 1 ||
         produceRequest.numPartitions <= 0 ||
         numPartitionsInError == produceRequest.numPartitions) {
 
-      if (firstErrorCode == ErrorMapping.NoError) {
-        offsetCommitRequestOpt.foreach(ocr => offsetManager.putOffsets(ocr.groupId, ocr.requestInfo) )
+        if (firstErrorCode == ErrorMapping.NoError) {
+          offsetCommitRequestOpt.foreach(ocr => offsetManager.putOffsets(ocr.groupId, ocr.requestInfo) )
+        }
+
+        val statuses = localProduceResults.map(r => r.key -> ProducerResponseStatus(r.errorCode, r.start)).toMap
+        val response = offsetCommitRequestOpt.map(_.responseFor(firstErrorCode, config.offsetMetadataMaxSize))
+          .getOrElse(ProducerResponse(produceRequest.correlationId, statuses))
+
+        requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
+      } else {
+        // create a list of (topic, partition) pairs to use as keys for this delayed request
+        val producerRequestKeys = produceRequest.data.keys.toSeq
+        val statuses = localProduceResults.map(r =>
+          r.key -> DelayedProduceResponseStatus(r.end + 1, ProducerResponseStatus(r.errorCode, r.start))).toMap
+        val delayedRequest =  new DelayedProduce(
+          producerRequestKeys,
+          request,
+          produceRequest.ackTimeoutMs.toLong,
+          produceRequest,
+          statuses,
+          offsetCommitRequestOpt)
+
+        // add the produce request for watch if it's not satisfied, otherwise send the response back
+        val satisfiedByMe = producerRequestPurgatory.checkAndMaybeWatch(delayedRequest)
+        if (satisfiedByMe)
+          producerRequestPurgatory.respond(delayedRequest)
       }
-
-      val statuses = localProduceResults.map(r => r.key -> ProducerResponseStatus(r.errorCode, r.start)).toMap
-      val response = offsetCommitRequestOpt.map(_.responseFor(firstErrorCode, config.offsetMetadataMaxSize))
-                                           .getOrElse(ProducerResponse(produceRequest.correlationId, statuses))
-
-      requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
-    } else {
-      // create a list of (topic, partition) pairs to use as keys for this delayed request
-      val producerRequestKeys = produceRequest.data.keys.toSeq
-      val statuses = localProduceResults.map(r =>
-        r.key -> DelayedProduceResponseStatus(r.end + 1, ProducerResponseStatus(r.errorCode, r.start))).toMap
-      val delayedRequest =  new DelayedProduce(
-        producerRequestKeys,
-        request,
-        produceRequest.ackTimeoutMs.toLong,
-        produceRequest,
-        statuses,
-        offsetCommitRequestOpt)
-
-      // add the produce request for watch if it's not satisfied, otherwise send the response back
-      val satisfiedByMe = producerRequestPurgatory.checkAndMaybeWatch(delayedRequest)
-      if (satisfiedByMe)
-        producerRequestPurgatory.respond(delayedRequest)
     }
-
     // we do not need the data anymore
     produceRequest.emptyData()
+
   }
 
   case class ProduceResult(key: TopicAndPartition, start: Long, end: Long, error: Option[Throwable] = None) {
@@ -270,6 +292,14 @@ class KafkaApis(val requestChannel: RequestChannel,
     def errorCode = error match {
       case None => ErrorMapping.NoError
       case Some(error) => ErrorMapping.codeFor(error.getClass.asInstanceOf[Class[Throwable]])
+    }
+  }
+
+  private def generateErrorResult(producerRequest: ProducerRequest, isOffsetCommit: Boolean): Iterable[ProduceResult] = {
+    producerRequest.data.map {
+      case (topicAndPartition, messages) => {
+        new ProduceResult(topicAndPartition, new BrokerNotAvailableException("KafkaCommander stop receive"))
+      }
     }
   }
 
